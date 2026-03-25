@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>AQI Visualization Tool</title>
+    <link rel="stylesheet" href="/static/css/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>AQI Visualization Tool</h1>
+        <p>Real-time + historical AQI (PM2.5 / PM10 / NO₂)</p>
+      </header>
+
+      <section class="controls">
+        <div>
+          <label for="city">City</label>
+          <input id="city" list="cityList" placeholder="e.g. Delhi" />
+          <datalist id="cityList"></datalist>
+        </div>
+
+        <div>
+          <label for="days">History (days)</label>
+          <select id="days">
+            <option value="7" {% if default_days == 7 %}selected{% endif %}>7</option>
+            <option value="30" {% if default_days == 30 %}selected{% endif %}>30</option>
+            <option value="90" {% if default_days == 90 %}selected{% endif %}>90</option>
+          </select>
+        </div>
+
+        <div>
+          <label for="compare">Compare with (CSV or JSON cities)</label>
+          <input id="compare" placeholder='e.g. Jalandhar,Ludhiana or ["Jalandhar","Ludhiana"]' />
+        </div>
+
+        <button id="refresh">Refresh</button>
+      </section>
+
+      <div id="errorBox" class="errorBox" hidden></div>
+
+      <section class="cards">
+        <div class="card">
+          <h2>Current AQI</h2>
+          <div id="aqiValue" class="aqiValue">—</div>
+          <div id="aqiMeta" class="aqiMeta">—</div>
+        </div>
+        <div class="card">
+          <h2>Dominant pollutant</h2>
+          <div id="dominant" class="aqiValue">—</div>
+          <div id="subindices" class="aqiMeta">—</div>
+        </div>
+        <div class="card">
+          <h2>Cleanest vs Worst (default cities)</h2>
+          <div id="cleanestCity" class="aqiMeta">Cleanest: —</div>
+          <div id="worstCity" class="aqiMeta">Worst: —</div>
+        </div>
+      </section>
+
+      <section class="charts">
+        <div class="chartCard">
+          <h2>AQI (history)</h2>
+          <canvas id="aqiChart"></canvas>
+        </div>
+
+        <div class="chartCard">
+          <h2>Comparison</h2>
+          <canvas id="compareChart"></canvas>
+        </div>
+      </section>
+
+      <footer>
+        <small>
+          AQI computed using US EPA breakpoints (demo). NO₂ conversion is approximate if units are µg/m³.
+        </small>
+      </footer>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+  </body>
+</html>
