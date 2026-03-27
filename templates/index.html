@@ -4,14 +4,32 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>AQI Visualization Tool</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
     <link rel="stylesheet" href="/static/css/styles.css" />
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   </head>
   <body>
+    <div class="bgOrbs" aria-hidden="true"></div>
     <div class="container">
-      <header>
-        <h1>AQI Visualization Tool</h1>
-        <p>Real-time + historical AQI (PM2.5 / PM10 / NO₂)</p>
+      <header class="topbar">
+        <div>
+          <h1>AQI Visualization Tool</h1>
+          <p>Real-time + historical AQI (PM2.5 / PM10 / NO₂)</p>
+        </div>
+        <button id="themeToggle" class="themeToggle" type="button" aria-label="Toggle theme">
+          <span id="themeToggleLabel">Dark mode</span>
+        </button>
       </header>
 
       <section class="controls">
@@ -59,14 +77,31 @@
       </section>
 
       <section class="charts">
+        <div class="mapCard chartCard">
+          <h2>Global AQI Map (configured cities)</h2>
+          <div id="cityMap"></div>
+          <div id="mapMeta" class="aqiMeta">Loading map points...</div>
+          <div id="mapWarning" class="aqiMeta" hidden></div>
+        </div>
+
         <div class="chartCard">
-          <h2>AQI (history)</h2>
+          <h2 id="historyTitle">AQI (history)</h2>
           <canvas id="aqiChart"></canvas>
+        </div>
+
+        <div class="chartCard">
+          <h2>5-Day AQI Forecast</h2>
+          <canvas id="forecastChart"></canvas>
         </div>
 
         <div class="chartCard">
           <h2>Comparison</h2>
           <canvas id="compareChart"></canvas>
+        </div>
+
+        <div class="chartCard">
+          <h2 id="trendTitle">Trend (AQI + 3-day moving average)</h2>
+          <canvas id="trendChart"></canvas>
         </div>
       </section>
 
@@ -77,6 +112,11 @@
       </footer>
     </div>
 
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
     <script src="/static/js/app.js"></script>
   </body>
 </html>

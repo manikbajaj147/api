@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
@@ -10,6 +11,36 @@ from flask import Flask, jsonify, render_template, request
 from services.aqi import aqi_from_concentrations
 from services.cache import TTLCache
 from services.openaq_client import OpenAQClient, OpenAQError
+
+
+class FixedWindowRateLimiter:
+    def __init__(self, limit_per_window: int, window_seconds: int = 60):
+        self.limit_per_window = max(0, int(limit_per_window))
+        self.window_seconds = max(1, int(window_seconds))
+        self._lock = threading.Lock()
+        self._windows: Dict[str, Dict[str, int]] = {}
+
+    def check(self, key: str) -> tuple[bool, int]:
+        if self.limit_per_window <= 0:
+            return True, 0
+
+        now = int(datetime.now(timezone.utc).timestamp())
+        with self._lock:
+            bucket = self._windows.get(key)
+            if not bucket or now >= bucket["reset_at"]:
+                self._windows[key] = {
+                    "count": 1,
+                    "reset_at": now + self.window_seconds,
+                }
+                return True, self.window_seconds
+
+            if bucket["count"] >= self.limit_per_window:
+                retry_after = max(1, bucket["reset_at"] - now)
+                return False, retry_after
+
+            bucket["count"] += 1
+            retry_after = max(1, bucket["reset_at"] - now)
+            return True, retry_after
 
 
 def create_app() -> Flask:
@@ -43,18 +74,71 @@ def create_app() -> Flask:
     ]
     warm_cache_enabled = os.getenv("WARM_CACHE_ON_START", "1") == "1"
     warm_cache_days = int(os.getenv("WARM_CACHE_DAYS", "90"))
+    warm_cache_include_history = os.getenv("WARM_CACHE_INCLUDE_HISTORY", "0") == "1"
+    warm_cache_max_cities = int(os.getenv("WARM_CACHE_MAX_CITIES", "25"))
+    warm_cache_request_delay_seconds = float(os.getenv("WARM_CACHE_REQUEST_DELAY_SECONDS", "0.35"))
+    warm_cache_abort_on_429 = os.getenv("WARM_CACHE_ABORT_ON_429", "1") == "1"
+    warm_cache_cooldown_on_429_seconds = float(
+        os.getenv("WARM_CACHE_COOLDOWN_ON_429_SECONDS", "20")
+    )
+    forecast_days_default = int(os.getenv("DEFAULT_FORECAST_DAYS", "5"))
+    map_default_limit = int(os.getenv("MAP_DEFAULT_CITIES_LIMIT", "60"))
+    map_max_limit = int(os.getenv("MAP_MAX_CITIES_LIMIT", "120"))
     warm_cache_cities = [
         c.strip()
         for c in os.getenv("WARM_CACHE_CITIES", ",".join(default_cities)).split(",")
         if c.strip()
     ]
+    configured_api_keys = {
+        key.strip()
+        for key in (
+            os.getenv("API_KEY", "") + "," + os.getenv("API_KEYS", "")
+        ).split(",")
+        if key.strip()
+    }
+    require_api_key = os.getenv("REQUIRE_API_KEY", "0") == "1"
+    rate_limit_per_minute = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 
     cache = TTLCache(default_ttl_seconds=int(os.getenv("CACHE_TTL_SECONDS", "900")))
+    rate_limiter = FixedWindowRateLimiter(limit_per_window=rate_limit_per_minute, window_seconds=60)
     client = OpenAQClient(
         base_url=api_base_url,
         geocode_url=geocode_base_url,
         timeout_seconds=provider_timeout_seconds,
     )
+
+    @app.before_request
+    def protect_api() -> Any:
+        if not request.path.startswith("/api/"):
+            return None
+
+        api_key = request.headers.get("X-API-Key", "").strip()
+        if not api_key:
+            api_key = request.args.get("api_key", "").strip()
+
+        if (require_api_key or configured_api_keys) and not api_key:
+            return jsonify({"error": "missing API key"}), 401
+        if configured_api_keys and api_key not in configured_api_keys:
+            return jsonify({"error": "invalid API key"}), 401
+
+        principal = api_key
+        if not principal:
+            fwd_for = request.headers.get("X-Forwarded-For", "")
+            principal = (fwd_for.split(",")[0].strip() if fwd_for else request.remote_addr) or "unknown"
+
+        allowed, retry_after = rate_limiter.check(f"api:{principal}")
+        if not allowed:
+            response = jsonify(
+                {
+                    "error": "rate limit exceeded",
+                    "retry_after_seconds": retry_after,
+                    "limit_per_minute": rate_limit_per_minute,
+                }
+            )
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+        return None
 
     def build_daily_series(points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # Daily buckets: last value per day per pollutant
@@ -115,6 +199,65 @@ def create_app() -> Flask:
             "date_to": end.isoformat(),
             "days": days_n,
             "series": build_daily_series(points),
+        }
+
+    def get_forecast_payload(city: str, days_n: int) -> Dict[str, Any]:
+        points = client.get_city_forecast(city=city, parameters=["pm25", "pm10", "no2"], days=days_n)
+        series = build_daily_series(points)
+        return {
+            "city": city,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "days": days_n,
+            "series": [
+                {
+                    "day": p["day"],
+                    "concentrations": p["concentrations"],
+                    "aqi": p["aqi"],
+                }
+                for p in series[:days_n]
+            ],
+        }
+
+    def get_trend_payload(city: str, days_n: int) -> Dict[str, Any]:
+        history_payload = get_history_payload(city, days_n)
+        series = history_payload["series"]
+
+        overall_values: List[int] = [
+            int(item["aqi"]["overall"])
+            for item in series
+            if item.get("aqi") and item["aqi"].get("overall") is not None
+        ]
+
+        trend_points: List[Dict[str, Any]] = []
+        rolling_values: List[int] = []
+        for item in series:
+            overall = item.get("aqi", {}).get("overall")
+            if overall is not None:
+                rolling_values.append(int(overall))
+            window = rolling_values[-3:]
+            moving_avg_3d = round(sum(window) / len(window), 1) if window else None
+            trend_points.append({"day": item["day"], "aqi": overall, "moving_avg_3d": moving_avg_3d})
+
+        change = None
+        slope_per_day = None
+        direction = "stable"
+        if len(overall_values) >= 2:
+            change = overall_values[-1] - overall_values[0]
+            slope_per_day = round(change / max(1, len(overall_values) - 1), 2)
+            if slope_per_day > 3:
+                direction = "worsening"
+            elif slope_per_day < -3:
+                direction = "improving"
+
+        return {
+            "city": city,
+            "days": days_n,
+            "summary": {
+                "direction": direction,
+                "change": change,
+                "slope_per_day": slope_per_day,
+            },
+            "series": trend_points,
         }
 
     @app.get("/")
@@ -236,6 +379,130 @@ def create_app() -> Flask:
         cache.set(cache_key, payload)
         return jsonify(payload)
 
+    @app.get("/api/forecast")
+    def forecast():
+        city = request.args.get("city", "").strip()
+        if not city:
+            return jsonify({"error": "city is required"}), 400
+
+        try:
+            days_n = max(1, min(10, int(request.args.get("days", str(forecast_days_default)))))
+        except ValueError:
+            return jsonify({"error": "days must be an integer"}), 400
+
+        cache_key = f"forecast:{city.lower()}:{days_n}"
+        cached = cache.get(cache_key)
+        if cached:
+            return jsonify(cached)
+
+        try:
+            payload = get_forecast_payload(city, days_n)
+        except OpenAQError as e:
+            stale = cache.get_stale(cache_key)
+            if stale:
+                return jsonify(stale_response(stale, f"Live provider unavailable: {str(e)}"))
+            return jsonify({"error": str(e)}), 502
+
+        cache.set(cache_key, payload)
+        return jsonify(payload)
+
+    @app.get("/api/trend")
+    def trend():
+        city = request.args.get("city", "").strip()
+        if not city:
+            return jsonify({"error": "city is required"}), 400
+
+        try:
+            days_n = max(3, min(365, int(request.args.get("days", str(default_days)))))
+        except ValueError:
+            return jsonify({"error": "days must be an integer"}), 400
+
+        cache_key = f"trend:{city.lower()}:{days_n}"
+        cached = cache.get(cache_key)
+        if cached:
+            return jsonify(cached)
+
+        try:
+            payload = get_trend_payload(city, days_n)
+        except OpenAQError as e:
+            stale = cache.get_stale(cache_key)
+            if stale:
+                return jsonify(stale_response(stale, f"Live provider unavailable: {str(e)}"))
+            return jsonify({"error": str(e)}), 502
+
+        cache.set(cache_key, payload)
+        return jsonify(payload)
+
+    @app.get("/api/map-cities")
+    def map_cities():
+        try:
+            limit = max(1, min(len(default_cities), map_max_limit, int(request.args.get("limit", str(map_default_limit)))))
+        except ValueError:
+            return jsonify({"error": "limit must be an integer"}), 400
+
+        target_cities = default_cities[:limit]
+        cache_key = f"map-cities:{limit}"
+        stale_map = cache.get_stale(cache_key)
+        cached = cache.get(cache_key)
+        if cached:
+            return jsonify(cached)
+
+        out: Dict[str, Any] = {"cities": [], "count": 0, "limit": limit}
+        warnings: Dict[str, str] = {}
+
+        def build_map_point(city: str) -> Dict[str, Any]:
+            city_cache_key = f"current:{city.lower()}"
+            current_payload = cache.get(city_cache_key)
+            if not current_payload:
+                current_payload = get_current_payload(city)
+                cache.set(city_cache_key, current_payload)
+
+            meta = client.get_city_metadata(city)
+            overall = (current_payload.get("aqi") or {}).get("overall")
+            return {
+                "city": meta["city"],
+                "query_city": city,
+                "country": meta.get("country", ""),
+                "country_code": meta.get("country_code", ""),
+                "latitude": meta["latitude"],
+                "longitude": meta["longitude"],
+                "aqi": overall,
+                "dominant": (current_payload.get("aqi") or {}).get("dominant"),
+                "timestamp": current_payload.get("timestamp"),
+            }
+
+        with ThreadPoolExecutor(max_workers=min(3, len(target_cities))) as executor:
+            futures = {executor.submit(build_map_point, city): city for city in target_cities}
+            for future in as_completed(futures):
+                city = futures[future]
+                try:
+                    point = future.result()
+                    if point.get("aqi") is None:
+                        warnings[city] = "AQI overall is unavailable"
+                        continue
+                    out["cities"].append(point)
+                except OpenAQError as e:
+                    warnings[city] = str(e)
+
+        out["cities"] = sorted(out["cities"], key=lambda point: point["aqi"])
+        out["count"] = len(out["cities"])
+        if warnings:
+            out["partial"] = True
+            out["warnings"] = warnings
+
+        if out["count"] == 0:
+            if stale_map:
+                return jsonify(
+                    stale_response(
+                        stale_map,
+                        "Live provider unavailable for map data; returning cached map payload.",
+                    )
+                )
+            return jsonify({"error": "no AQI map data available", "details": warnings}), 502
+
+        cache.set(cache_key, out)
+        return jsonify(out)
+
     def parse_compare_cities() -> List[str]:
         cities_q = request.args.get("cities", "").strip()
         if cities_q:
@@ -353,19 +620,48 @@ def create_app() -> Flask:
         return jsonify(out)
 
     def warm_history_and_current_cache() -> None:
-        for city in warm_cache_cities:
+        target_cities = warm_cache_cities
+        if warm_cache_max_cities > 0:
+            target_cities = target_cities[:warm_cache_max_cities]
+
+        for idx, city in enumerate(target_cities):
+            if idx > 0 and warm_cache_request_delay_seconds > 0:
+                time.sleep(warm_cache_request_delay_seconds)
+
             try:
                 current_payload = get_current_payload(city)
             except OpenAQError as e:
+                if "HTTP 429" in str(e):
+                    app.logger.warning(
+                        "Warm cache received provider 429 after %s/%s cities. "
+                        "Reduce WARM_CACHE_MAX_CITIES or increase WARM_CACHE_REQUEST_DELAY_SECONDS.",
+                        idx,
+                        len(target_cities),
+                    )
+                    if warm_cache_cooldown_on_429_seconds > 0:
+                        time.sleep(warm_cache_cooldown_on_429_seconds)
+                    if warm_cache_abort_on_429:
+                        break
                 app.logger.warning("Warm current cache failed for %s: %s", city, e)
                 continue
             cache.set(f"current:{city.lower()}", current_payload)
 
-            try:
-                history_payload = get_history_payload(city, warm_cache_days)
-                cache.set(f"history:{city.lower()}:{warm_cache_days}", history_payload)
-            except OpenAQError as e:
-                app.logger.warning("Warm history cache failed for %s: %s", city, e)
+            if warm_cache_include_history:
+                try:
+                    history_payload = get_history_payload(city, warm_cache_days)
+                    cache.set(f"history:{city.lower()}:{warm_cache_days}", history_payload)
+                except OpenAQError as e:
+                    if "HTTP 429" in str(e):
+                        app.logger.warning(
+                            "Warm history cache received provider 429 after %s/%s cities.",
+                            idx,
+                            len(target_cities),
+                        )
+                        if warm_cache_cooldown_on_429_seconds > 0:
+                            time.sleep(warm_cache_cooldown_on_429_seconds)
+                        if warm_cache_abort_on_429:
+                            break
+                    app.logger.warning("Warm history cache failed for %s: %s", city, e)
 
     if warm_cache_enabled:
         threading.Thread(target=warm_history_and_current_cache, daemon=True).start()

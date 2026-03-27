@@ -94,7 +94,31 @@ class OpenAQClient:
     def _resolve_city(self, city: str) -> Dict[str, Any]:
         city_key = city.strip().lower()
         if city_key in self.CITY_COORDS:
-            return dict(self.CITY_COORDS[city_key])
+            # Keep deterministic coordinates for known cities, but enrich with
+            # country metadata from geocoding when available.
+            hardcoded = dict(self.CITY_COORDS[city_key])
+            try:
+                data = self._get(
+                    self.geocode_url,
+                    "/search",
+                    {
+                        "name": hardcoded.get("name", city),
+                        "count": 1,
+                        "language": "en",
+                        "format": "json",
+                    },
+                )
+                results = data.get("results") or []
+                if results:
+                    geo = results[0]
+                    hardcoded["country"] = geo.get("country") or hardcoded.get("country", "")
+                    hardcoded["country_code"] = geo.get("country_code") or hardcoded.get(
+                        "country_code", ""
+                    )
+            except OpenAQError:
+                # Fall back to hardcoded metadata if geocoding is unavailable.
+                pass
+            return hardcoded
 
         data = self._get(
             self.geocode_url,
@@ -105,6 +129,41 @@ class OpenAQClient:
         if not results:
             raise OpenAQError(f"City '{city}' was not found.")
         return results[0]
+
+    def get_city_metadata(self, city: str) -> Dict[str, Any]:
+        city_info = self._resolve_city(city)
+        lat = city_info.get("latitude")
+        lon = city_info.get("longitude")
+        if lat is None or lon is None:
+            raise OpenAQError(f"City coordinates missing for '{city}'.")
+
+        country = city_info.get("country", "")
+        country_code = city_info.get("country_code", "")
+
+        # For static CITY_COORDS entries we may not have country fields; fill from geocoding.
+        if not country or not country_code:
+            try:
+                data = self._get(
+                    self.geocode_url,
+                    "/search",
+                    {"name": city, "count": 1, "language": "en", "format": "json"},
+                )
+                results = data.get("results") or []
+                if results:
+                    match = results[0]
+                    country = country or match.get("country", "")
+                    country_code = country_code or match.get("country_code", "")
+            except OpenAQError:
+                # Keep metadata usable even if geocoding fallback fails.
+                pass
+
+        return {
+            "city": city_info.get("name", city),
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "country": country,
+            "country_code": country_code,
+        }
 
     @staticmethod
     def _parameter_map() -> Dict[str, str]:
@@ -236,4 +295,58 @@ class OpenAQClient:
 
         if not all_points:
             raise OpenAQError(f"No historical measurements found for city '{city}'.")
+        return all_points
+
+    def get_city_forecast(self, city: str, parameters: List[str], days: int = 5) -> List[Dict[str, Any]]:
+        city_info = self._resolve_city(city)
+        lat = city_info.get("latitude")
+        lon = city_info.get("longitude")
+        if lat is None or lon is None:
+            raise OpenAQError(f"City coordinates missing for '{city}'.")
+
+        pmap = self._parameter_map()
+        inverse_pmap = {v: k for k, v in pmap.items()}
+        units = self._unit_map()
+
+        hourly_fields = [pmap[p] for p in parameters if p in pmap]
+        if not hourly_fields:
+            raise OpenAQError("No supported parameters were requested.")
+
+        data = self._get(
+            self.base_url,
+            "/air-quality",
+            {
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": ",".join(hourly_fields),
+                "timezone": "UTC",
+                "forecast_days": max(1, min(10, int(days))),
+            },
+        )
+        hourly = data.get("hourly") or {}
+        times = hourly.get("time") or []
+
+        all_points: List[Dict[str, Any]] = []
+        for idx, timestamp in enumerate(times):
+            for src_key in hourly_fields:
+                values = hourly.get(src_key) or []
+                if idx >= len(values):
+                    continue
+                value = values[idx]
+                if value is None:
+                    continue
+                param = inverse_pmap.get(src_key)
+                if param is None:
+                    continue
+                all_points.append(
+                    {
+                        "parameter": param,
+                        "value": float(value),
+                        "unit": units.get(param, ""),
+                        "date": timestamp,
+                    }
+                )
+
+        if not all_points:
+            raise OpenAQError(f"No forecast measurements found for city '{city}'.")
         return all_points

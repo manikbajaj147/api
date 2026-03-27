@@ -23,6 +23,9 @@ Open http://localhost:5000
 - `/api/cities`
 - `/api/current?city=Los%20Angeles`
 - `/api/history?city=Los%20Angeles&days=30`
+- `/api/forecast?city=Los%20Angeles&days=5`
+- `/api/trend?city=Los%20Angeles&days=30`
+- `/api/map-cities?limit=40` (AQI + coordinates for configured city markers)
 - `/api/extremes` (cleanest and worst AQI city among configured default cities)
 - `/api/compare?cities=Los%20Angeles,New%20York,Chicago,Houston&days=30` (up to 10 cities)
 - `POST /api/compare` with JSON body: `{"cities": ["Los Angeles", "New York", "Chicago"], "days": 30}`
@@ -44,8 +47,24 @@ If the upstream provider is temporarily unreachable, the API now serves stale ca
 - OpenAQ client retries provider calls on transient errors (default retries: 2)
 - CACHE_TTL_SECONDS (default: 900)
 - DEFAULT_HISTORY_DAYS (default: 90)
+- DEFAULT_FORECAST_DAYS (default: 5)
+- MAP_DEFAULT_CITIES_LIMIT (default: 60)
+- MAP_MAX_CITIES_LIMIT (default: 120)
 - DEFAULT_CITIES (default includes popular India cities, Punjab cities, and global cities)
 - Global reference cities included in defaults: Reykjavik (clean-air reference), Lahore (high-AQI reference)
 - WARM_CACHE_ON_START (default: 1)
 - WARM_CACHE_DAYS (default: 90)
 - WARM_CACHE_CITIES (default: DEFAULT_CITIES)
+- WARM_CACHE_INCLUDE_HISTORY (default: 0; set to 1 to warm /api/history too)
+- WARM_CACHE_MAX_CITIES (default: 25; set 0 to use all WARM_CACHE_CITIES)
+- WARM_CACHE_REQUEST_DELAY_SECONDS (default: 0.35)
+- WARM_CACHE_ABORT_ON_429 (default: 1)
+- WARM_CACHE_COOLDOWN_ON_429_SECONDS (default: 20)
+- RATE_LIMIT_PER_MINUTE (default: 120; set 0 to disable)
+- REQUIRE_API_KEY (default: 0)
+- API_KEY / API_KEYS (comma-separated list of accepted keys)
+
+## Security Controls
+- API key can be sent as `X-API-Key` header (preferred) or `api_key` query param.
+- Rate limit is applied per API key when provided, otherwise per client IP.
+- Frontend can send API key automatically if `localStorage["aqi-api-key"]` is set.
